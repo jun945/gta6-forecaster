@@ -1,195 +1,205 @@
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+"""Forecast GTA6 Twitch concurrency from one known launch-hour print.
 
-"""Forecast GTA VI launch-day Twitch CCU for hours 2-24.
-Normalize 14-day pre-release viewer signatures, pick the 12 nearest comparable
-launches, scale their release curves to the known hour-1 anchor, then expand the
-median shape with lognormal quantiles (SIGMA=0.45, K=12, PRE_DAYS=14).
+Each competition case supplies the hour-1 audience plus a set of past
+launches ("comparables") with hourly audience histories.  For every
+comparable we build a release curve curve[1..24]: curve[h] is the total
+audience at hour-of-day h-1 on that comparable's launch date, so hour 1 is
+hour 0 of the launch day and hour 24 is hour 23.
+
+The forecast is an hour-1 kernel over those curves.  The target's known
+hour-1 audience anchors the level, and each comparable is weighted by
+
+    w = exp(-(log(anchor / curve[1])) ** 2 / (2 * 0.6 ** 2))
+
+so launches with a similar opening hour dominate.  The log-scale kernel
+width of 0.6 makes that neighborhood scale-free: openings within roughly a
+factor of exp(0.6) ~ 1.8 of the anchor still carry meaningful weight.  For
+each future hour we take the weighted mean of the comparable
+hour-to-hour-1 ratios and scale the anchor by it.  Multiplicative uncertainty z * 0.35 * sqrt(h-1) yields the
+5th/25th/50th/75th/95th percentile band, clamped to positive values and
+forced non-decreasing over time.  Each case <id> becomes
+<MAKEFUN_OUTPUT_DIR>/<id>.out containing {"hours": [...]}.
 """
 
 import json
 import math
 import os
-from datetime import datetime, timedelta
-from statistics import median
+import sys
+from datetime import datetime
+from pathlib import Path
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
-SIGMA = 0.45
-K = 12
-PRE_DAYS = 14
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+
+Z5 = (-1.644854, -0.674490, 0.0, 0.674490, 1.644854)
+KERNEL_WIDTH = 0.6
+SPREAD_PER_SQRT_HOUR = 0.35
+MIN_WEIGHT_SUM = 1e-9
 MIN_Q = 0.01
-MAX_Q = 1_000_000_000.0
+MAX_Q = 1e9
+MAX_RATIO = 50.0
+FALLBACK_COUNT = 5
+HOURS = range(2, 25)
 
 
-def parse_iso(value):
-    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed
-
-
-def round2(value):
-    rounded = math.floor(value * 100.0 + 0.5) / 100.0
-    return int(rounded) if rounded == int(rounded) else rounded
-
-
-def _viewers(point):
+def _to_float(value):
     try:
-        value = float(point.get("viewers", 0) or 0)
+        number = float(value)
     except (TypeError, ValueError):
-        return 0.0
-    return value if math.isfinite(value) and value > 0 else 0.0
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
 
 
-def _pre_raw(points, day_start_dt):
-    raw = [0.0] * PRE_DAYS
-    window_start = day_start_dt - timedelta(days=PRE_DAYS)
-    for point in points or []:
-        try:
-            timestamp = parse_iso(point["from"])
-        except (KeyError, TypeError, ValueError):
+def _parse_iso(value):
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _anchor(case):
+    known = case.get("known")
+    if isinstance(known, list) and known and isinstance(known[0], dict):
+        viewers = _to_float(known[0].get("viewers"))
+        if viewers is not None:
+            return max(1.0, viewers)
+    return 1.0
+
+
+def _release_curves(case):
+    comparables = case.get("comparables")
+    curves = []
+    if not isinstance(comparables, list):
+        return curves
+    for comparable in comparables:
+        if not isinstance(comparable, dict):
             continue
-        if window_start <= timestamp < day_start_dt:
-            index = int((timestamp - window_start).total_seconds() // 86400.0)
-            index = min(PRE_DAYS - 1, max(0, index))
-            raw[index] += _viewers(point)
-    return raw
-
-
-def pre_signature(points, day_start_dt):
-    raw = _pre_raw(points, day_start_dt)
-    mean = sum(raw) / PRE_DAYS
-    if mean <= 0:
-        return [1.0 / PRE_DAYS] * PRE_DAYS
-    return [value / mean for value in raw]
-
-
-def release_curve(comparable):
-    release_date = parse_iso(comparable["day_start"]).date()
-    by_hour = {}
-    for point in comparable.get("hourly") or []:
-        try:
-            timestamp = parse_iso(point["from"])
-        except (KeyError, TypeError, ValueError):
+        launch = _parse_iso(comparable.get("day_start"))
+        hourly = comparable.get("hourly")
+        if launch is None or not isinstance(hourly, list):
             continue
-        if timestamp.date() == release_date:
-            hour = timestamp.hour + 1
+        curve = [0.0] * 25
+        for point in hourly:
+            if not isinstance(point, dict):
+                continue
+            stamp = _parse_iso(point.get("from"))
+            viewers = _to_float(point.get("viewers"))
+            if stamp is None or viewers is None or viewers < 0:
+                continue
+            if stamp.date() != launch.date():
+                continue
+            hour = stamp.hour + 1
             if 1 <= hour <= 24:
-                by_hour[hour] = _viewers(point)
-    return [by_hour.get(hour, 0.0) for hour in range(1, 25)]
+                curve[hour] += viewers
+        if 0.0 < curve[1] < math.inf:
+            curves.append(curve)
+    return curves
 
 
-def _fallback_signature(comparables, game_name):
-    target = str(game_name or "").strip().lower()
-    for comparable in comparables:
-        if str(comparable.get("name", "")).strip().lower() == target:
-            return pre_signature(
-                comparable.get("hourly") or [], parse_iso(comparable["day_start"])
-            )
-    for comparable in comparables:
-        name = str(comparable.get("name", "")).lower()
-        if "grand" in name or "gta" in name:
-            return pre_signature(
-                comparable.get("hourly") or [], parse_iso(comparable["day_start"])
-            )
-    return None
+def _kernel_weight(anchor, opening):
+    gap = math.log(anchor / opening)
+    return math.exp(-(gap * gap) / (2.0 * KERNEL_WIDTH * KERNEL_WIDTH))
 
 
-def forecast_case(case):
-    levels = list(case.get("levels") or [])
-    if levels != LEVELS:
-        levels = list(LEVELS)
+def _forecast_ratio(anchor, curves, hour):
+    weighted_ratio = 0.0
+    weight_sum = 0.0
+    for curve in curves:
+        ratio = curve[hour] / curve[1]
+        if 0.0 < ratio < MAX_RATIO:
+            weight = _kernel_weight(anchor, curve[1])
+            weighted_ratio += weight * ratio
+            weight_sum += weight
+    if weight_sum >= MIN_WEIGHT_SUM:
+        return weighted_ratio / weight_sum
 
-    known = case.get("known") or []
-    hour_one = known[0] if known else {}
-    try:
-        anchor = float(hour_one.get("viewers", 1) or 1)
-    except (TypeError, ValueError):
-        anchor = 1.0
-    anchor = max(1.0, anchor)
-    if not math.isfinite(anchor):
-        anchor = 1.0
+    nearest = sorted(
+        curves, key=lambda curve: abs(math.log(anchor / curve[1]))
+    )[:FALLBACK_COUNT]
+    ratios = []
+    for curve in nearest:
+        ratio = curve[hour] / curve[1]
+        if 0.0 < ratio < MAX_RATIO:
+            ratios.append(ratio)
+    if ratios:
+        return sum(ratios) / len(ratios)
+    return 1.0
 
-    day_start_dt = parse_iso(case["day_start"])
-    comparables = case.get("comparables") or []
-    records = []
-    for comparable in comparables:
-        try:
-            curve = release_curve(comparable)
-            raw_pre = _pre_raw(comparable.get("hourly") or [], parse_iso(comparable["day_start"]))
-            signature = pre_signature(
-                comparable.get("hourly") or [], parse_iso(comparable["day_start"])
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
-        if curve[0] > 0 and any(value > 0 for value in raw_pre):
-            records.append(
-                (str(comparable.get("name", "")), signature, curve)
-            )
 
-    case_history = case.get("history_hourly") or []
-    raw_case = _pre_raw(case_history, day_start_dt)
-    signature_case = pre_signature(case_history, day_start_dt)
-    if sum(1 for value in raw_case if value > 0) < 10:
-        fallback = _fallback_signature(comparables, case.get("game", {}).get("name"))
-        if fallback is not None:
-            signature_case = fallback
+def _round2(value):
+    return math.floor(value * 100.0 + 0.5) / 100.0
 
-    if records:
-        def distance(record):
-            return sum(abs(a - b) for a, b in zip(signature_case, record[1]))
 
-        ordered = sorted(records, key=lambda record: (distance(record), record[0].lower()))
-        selected = ordered[:K]
-    else:
-        selected = []
-
-    hours = []
-    last_ratio = 1.0
-    for hour in range(2, 25):
-        ratios = []
-        for _, _, curve in selected:
-            base = curve[0]
-            if base > 0:
-                ratio = curve[hour - 1] / base
-                if ratio > 0 and math.isfinite(ratio):
-                    ratios.append(ratio)
-        ratio = median(ratios) if ratios else last_ratio
-        last_ratio = ratio
-        center = anchor * ratio
-        if not math.isfinite(center) or center <= 0:
-            center = anchor
-
+def _build_hours(anchor, curves):
+    rows = []
+    previous = None
+    for hour in HOURS:
+        center = anchor * _forecast_ratio(anchor, curves, hour)
+        # sqrt(h-1): log-scale variance accumulates linearly with elapsed hours
+        spread = SPREAD_PER_SQRT_HOUR * math.sqrt(hour - 1)
         quantiles = []
-        for z_value in Z:
-            value = center * math.exp(SIGMA * z_value)
-            value = min(MAX_Q, max(MIN_Q, value))
-            quantiles.append(round2(value))
-        for index in range(1, len(quantiles)):
-            if quantiles[index] < quantiles[index - 1]:
-                quantiles[index] = quantiles[index - 1]
-        hours.append({"hour": hour, "q": quantiles})
+        for index, z in enumerate(Z5):
+            value = center * math.exp(z * spread)
+            value = min(max(value, MIN_Q), MAX_Q)
+            value = _round2(value)
+            if previous is not None and value < previous[index]:
+                value = previous[index]
+            quantiles.append(value)
+        previous = quantiles
+        rows.append({"hour": hour, "q": quantiles})
+    return rows
 
-    return hours
+
+def _output_name(case, stem):
+    case_id = case.get("id")
+    name = str(case_id) if case_id else stem
+    name = Path(name).name
+    if not name or name in (".", ".."):
+        name = stem
+    return name
 
 
 def main():
-    input_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    output_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(OUTPUT_DIR)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 1
 
-    for input_path in sorted(input_dir.glob("*.in")):
-        with open(input_path, "r", encoding="utf-8") as handle:
-            case = json.load(handle)
-        result = {"hours": forecast_case(case)}
-        output_name = str(case.get("id") or input_path.stem)
-        output_name = Path(output_name).name
-        payload = json.dumps(result, separators=(",", ":")) + "\n"
-        with open(output_dir / (output_name + ".out"), "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(payload)
+    try:
+        paths = sorted(Path(INPUT_DIR).glob("*.in"))
+    except OSError:
+        paths = []
+
+    for path in paths:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                case = json.load(handle)
+        except (OSError, ValueError):
+            case = {}
+        if not isinstance(case, dict):
+            case = {}
+
+        hours = _build_hours(_anchor(case), _release_curves(case))
+        payload = json.dumps(
+            {"hours": hours}, separators=(",", ":"), ensure_ascii=True
+        ) + "\n"
+        target = out_dir / (_output_name(case, path.stem) + ".out")
+        try:
+            target.write_text(payload, encoding="ascii")
+        except OSError:
+            continue
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
